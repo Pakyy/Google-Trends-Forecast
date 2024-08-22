@@ -1,0 +1,1383 @@
+---
+title: "Forecasting Google Trends with VAR and ARIMA Models"
+author: "Pasquale Gravante"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+format: 
+  html:
+    keep-tex: true
+    include-in-header: 
+       text: |
+         \usepackage{fvextra}
+         \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+         \DefineVerbatimEnvironment{OutputCode}{Verbatim}{breaklines,commandchars=\\\{\}}
+editor_options:
+  chunk_output_type: console
+execute:
+  echo: false
+---
+
+```{r, echo=FALSE}
+# Set global options
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=8, fig.height=6)
+```
+
+# INTROUDCTION
+
+This project aims to forecast Google Trends data for search terms using Vector Autoregression (VAR) and Autoregressive Integrated Moving Average (ARIMA) models. The analysis will involve data collection, preprocessing, stationarity testing, model selection, diagnostics, and forecasting. By the end of this project, we will compare the performance of VAR and ARIMA models in terms of their forecasting accuracy.
+
+For the first part of the project, the data of the last 5 years for the "AI" search term is going to be used and then also the data for the "Chat GPT" search term is going to be used.
+
+# FIRST TIME SERIES
+
+# DATA COLLECTION AND PRE-PROCESSING
+
+```{r}
+library(gtrendsR)
+library(vars)
+library(forecast)
+library(ggplot2)
+library(urca)
+library(xts)
+library(readr)
+library(tidyverse)
+library(lmtest)
+library(tseries)
+library(fUnitRoots)
+library(quantmod)
+library(kableExtra)
+library(lubridate)
+library(formattable)
+```
+
+The necessary libraries are loaded, and the data is imported from a CSV file. The first few rows of the dataset are displayed to ensure it has been loaded correctly.
+
+```{r}
+# Load the CSV file
+trend1_data <- read_csv("AItrend.csv")
+
+# Check the data
+head(trend1_data)
+```
+
+# PRE-PROCESSING
+
+The 'Week' column is converted to Date format for time series analysis. The structure of the dataset is checked to confirm the conversion.
+
+```{r}
+# Convert the 'week' column to Date type
+trend1_data$Week <- as.Date(trend1_data$Week, format = "%Y-%m-%d")
+
+# Check the data types to ensure the date conversion was successful
+str(trend1_data)
+```
+
+The dataset is then converted into an xts object, which is a common format for time series data since it facilitates time-based indexing and operations.
+
+```{r}
+# Convert the data frame to xts object
+trend1_xts <- xts(trend1_data$AI, order.by = trend1_data$Week)
+
+# View the first few rows of xts object
+head(trend1_xts)
+```
+
+## Visualization
+
+The time series data is visualized to observe trends, seasonal patterns, and any apparent anomalies in the 'AI' search trends over the last five years.
+
+```{r}
+plot(trend1_xts,
+     type = "l",
+     col  = "darkred",
+     lwd  = 3,
+     main = "'AI' Search Trends - Last 5 years")
+```
+
+# DETRENDING AND STATIONARITY
+
+In this section the stationarity assumption is addressed, since it is crucial in time series modeling. Non-stationary data can lead to unreliable and spurious results.
+
+## Transformations
+
+Log transformation is applied to stabilize the variance.
+
+```{r}
+# Log transformation
+log_trend1_xts <- log(trend1_xts)
+plot(log_trend1_xts,
+     type = "l",
+     col  = "darkred",
+     lwd  = 3,
+     main = "'AI' Search Trends - Last 5 years - Log")
+```
+
+## Differencing
+
+Differencing is used to remove trends and achieve stationarity.
+
+```{r}
+diff_log_trend1_xts <- diff(log_trend1_xts, differences = 1)
+plot(diff_log_trend1_xts,
+     type = "l",
+     col  = "darkred",
+     lwd  = 3,
+     main = "'AI' Search Trends - Last 5 years - Log")
+```
+
+The graph suggests that stationarity has been achieved but it has to be checked through the relative tests.
+
+## ADF Test for stationarity
+
+The Augmented Dickey-Fuller (ADF) test checks for the presence of a unit root in the series, which indicates non-stationarity.
+
+```{r}
+# Apply the ADF test to the differenced series
+diff_log_trend1_xts <- diff_log_trend1_xts[-1,]
+adf_test <- ur.df(diff_log_trend1_xts, type = "drift", lags = 0)
+summary(adf_test)
+```
+
+The test statistic value (-18.8086) is far below the critical values at all common significance levels (1%, 5%, and 10%), strongly indicating the rejection of the null hypothesis of a unit root. This result confirms that the time series is stationary.
+
+## PP Test for stationarity
+
+The Phillips-Perron (PP) test also checks for a unit root, accounting for serial correlation in the error terms.
+
+```{r}
+pp.test <- ur.pp(diff_log_trend1_xts,   # tested series
+                 type = c("Z-tau"),     # standardization of the test statistic needed
+                 model = c("constant")) # constant deterministic component
+# which means we assume that any trends in the data are stochastic
+summary(pp.test)
+```
+
+The Z-tau test statistic value (-19.3793) is far below the critical values at all common significance levels (1%, 5%, and 10%), strongly indicating the rejection of the null hypothesis of a unit root. This confirms the results of the ADF test and we can say that the series is stationary.
+
+## KPSS Test
+
+The KPSS is like the other 2 tests but the hypothesis are inverted.
+
+```{r}
+kpss.test <- ur.kpss(diff_log_trend1_xts, 
+                     type = c("mu")) # constant deterministic 
+summary(kpss.test)
+```
+
+In this case the test-statistic of **0.51** is lower than than 2.5% critical value (0.574) so we **cannot reject the null** about **stationarity** of the first differences at **2.5% and 1% significance level**. (however we reject it at 5% level).
+
+By looking at the graph and from the results of the tests we can conclude that ***AI \~ I (1).***
+
+## ACF and PACF plots
+
+ACF shows the correlation between the time series and its lagged versions, while PACF gives the partial correlation of a stationary time series with its own lagged values. Their plots help in identifying the appropriate AR and MA terms for ARIMA modeling.
+
+```{r}
+# ACF and PACF plots of the differenced series
+acf_plot <- ggAcf(diff_log_trend1_xts, main = "ACF of Differenced Log-Transformed Data")
+pacf_plot <- ggPacf(diff_log_trend1_xts, main = "PACF of Differenced Log-Transformed Data")
+
+gridExtra::grid.arrange(acf_plot, pacf_plot, ncol = 2)
+```
+
+As shown by the plots, we can see some significant spikes at lag 1 and 2 for the ACF plot and some at lag 1, 2 and 9 in the PACF plot.
+
+# MODELING
+
+A grid search is conducted to identify the optimal ARIMA parameters based on AIC and BIC values. The results help in selecting the best combination of p, d, and q.
+
+## Grid search for ARIMA parameters
+
+```{r}
+# Define the parameter grid
+p_values <- c(1, 2, 9)
+d_values <- c(1)
+q_values <- c(1, 2, 8)
+
+# Initialize an empty list to store results
+results <- list()
+
+# Perform grid search WITHOUT CONSTANT
+for (p in p_values) {
+  for (d in d_values) {
+    for (q in q_values) {
+      # Fit the ARIMA model
+      model <- tryCatch(
+        {
+          Arima(log_trend1_xts, order = c(p, d, q))
+        },
+        error = function(e) NULL
+      )
+      
+      # Check if model fitting was successful
+      if (!is.null(model)) {
+        # Extract AIC and BIC
+        aic <- AIC(model)
+        bic <- BIC(model)
+        
+        # Store the results
+        results <- rbind(results, data.frame(p = p, d = d, q = q, AIC = aic, BIC = bic))
+      }
+    }
+  }
+}
+
+# Convert results to a data frame
+results_df <- as.data.frame(results)
+
+# Print the results
+print(results_df)
+```
+
+Above we find the table with the respective AIC and BIC values for each model (without including a constant).
+
+Now let's do the same thing by including a constant in the model and compare the results:
+
+```{r}
+# Define the parameter grid
+p_values <- c(1, 2, 9)
+d_values <- c(1)
+q_values <- c(1, 2, 8)
+
+# Initialize an empty list to store results
+results <- list()
+
+# Perform grid search WITHOUT CONSTANT
+for (p in p_values) {
+  for (d in d_values) {
+    for (q in q_values) {
+      # Fit the ARIMA model
+      model <- tryCatch(
+        {
+          Arima(log_trend1_xts, order = c(p, d, q), include.constant = TRUE)
+        },
+        error = function(e) NULL
+      )
+      
+      # Check if model fitting was successful
+      if (!is.null(model)) {
+        # Extract AIC and BIC
+        aic <- AIC(model)
+        bic <- BIC(model)
+        
+        # Store the results
+        results <- rbind(results, data.frame(p = p, d = d, q = q, AIC = aic, BIC = bic))
+      }
+    }
+  }
+}
+
+# Convert results to a data frame
+results_df <- as.data.frame(results)
+
+# Print the results
+print(results_df)
+```
+
+According to the table we can see that values are generally lower in this case, implying that drift should be included in the model.
+
+Let's now compare the best models in terms of AIC / BIC, that are ARIMA (1,1,1) since it has the best BIC, ARIMA (1,1,2) since it has the best AIC and ARIMA (2,1,1) since it has good values for both.
+
+## Model diagnostics
+
+In this section the residuals are explored to make sure they don't present autocorrelation (i.e. they are white noise).
+
+```{r}
+# Fit three different ARIMA models
+model1 <- Arima(log_trend1_xts, order = c(1, 1, 1), include.constant = TRUE)
+model2 <- Arima(log_trend1_xts, order = c(1, 1,2), include.constant = TRUE)
+model3 <- Arima(log_trend1_xts, order = c(2, 1, 1), include.constant = TRUE)
+
+# Extract residuals
+residuals_model1 <- residuals(model1)
+residuals_model2 <- residuals(model2)
+residuals_model3 <- residuals(model3)
+```
+
+ARIMA models have been ran and their respective residuals extracted.
+
+Let's see their plots:
+
+```{r}
+# Plot Residuals
+par(mfrow = c(3, 2))
+plot(residuals_model1, main = "Residuals of ARIMA(1,1,1)", ylab = "Residuals")
+plot(residuals_model2, main = "Residuals of ARIMA(1,1,2)", ylab = "Residuals")
+plot(residuals_model3, main = "Residuals of ARIMA(2,1,1)", ylab = "Residuals")
+```
+
+Residuals from different ARIMA models are plotted to visually inspect for white noise characteristics. Ideally, the residuals should appear random with no discernible patterns.
+
+ACF and PACF plots of the residuals are also examined to check for any remaining autocorrelation:
+
+```{r}
+# ACF and PACF of Residuals
+par(mfrow = c(3, 2))
+Acf(residuals_model1, main = "ACF of Residuals of ARIMA(1,1,1)")
+Pacf(residuals_model1, main = "PACF of Residuals of ARIMA(1,1,1)")
+Acf(residuals_model2, main = "ACF of Residuals of ARIMA(1,1,2)")
+Pacf(residuals_model2, main = "PACF of Residuals of ARIMA(1,1,2)")
+Acf(residuals_model3, main = "ACF of Residuals of ARIMA(2,1,1)")
+Pacf(residuals_model3, main = "PACF of Residuals of ARIMA(2,1,1)")
+```
+
+For each model, we can see some spikes at lag 8 and 9, so to choose the best one between the three, some tests have to performed:
+
+-   **Ljung-box test**: Checks the null hypothesis that the residuals are independently distributed (i.e. they are not autocorrelated).
+
+-   **Breusch-Godfrey test**: Checks the null hypothesis that there is no serial correlation in the residuals (i.e. they are white noise).
+
+For each test, we would like the p-value to be greater than 0.05
+
+We select number of **lags = 5** according to Ljung and Tsay (ln(T) = 5.5)
+
+```{r}
+# Perform tests on residuals to check for white noise
+lb_test_model1 <- Box.test(residuals_model1, lag = 5, type = "Ljung-Box")
+lb_test_model2 <- Box.test(residuals_model2, lag = 5, type = "Ljung-Box")
+lb_test_model3 <- Box.test(residuals_model3, lag = 5, type = "Ljung-Box")
+bg_test_model1 <- bgtest(residuals_model1 ~ fitted(model1), order = 5)
+bg_test_model2 <- bgtest(residuals_model2 ~ fitted(model2), order = 5)
+bg_test_model3 <- bgtest(residuals_model3 ~ fitted(model3), order = 5)
+```
+
+```{r}
+# Create a table to compare results
+comparison_table <- data.frame(
+  Model = c("ARIMA(1,1,1)", "ARIMA(1,1,2)", "ARIMA(2,1,1)"),
+  AIC = c(AIC(model1), AIC(model2), AIC(model3)),
+  BIC = c(BIC(model1), BIC(model2), BIC(model3)),
+  LjungBox_p_value = c(lb_test_model1$p.value, lb_test_model2$p.value, lb_test_model3$p.value),
+  BG_statistic = c(bg_test_model1$p.value, bg_test_model2$p.value, bg_test_model3$p.value)
+)
+
+# Print the comparison table
+print(comparison_table)
+```
+
+What we can say from the comparison table is:
+
+-   For the Ljung-Box test, all three models (ARIMA(1,1,1), ARIMA(1,1,2), ARIMA(2,1,1)) have p-values well above 0.05 (0.5442502, 0.9894031, 0.8770163 respectively), suggesting that none of the models have significant autocorrelation in their residuals.
+
+-   For the BG test, p-values for the models are 0.4715572, 0.9781981, and 0.7930028 respectively. This suggests that for all of the three models the residuals are white noise.
+
+-   **ARIMA (1,1,2)** has the highest p-values for both tests and the best AIC value, so it is selected as the model that is going to be used for the forecasts.
+
+## Automatic model diagnostics
+
+Now that the best model has been selected manually, some automatic model selection functions can be used and then compare the models' performances.
+
+### Auto AIC
+
+Models with all combinations of p from 1 to 9 and q from 1 to 9 are analyzed and rated according to their AIC value:
+
+```{r}
+arima.best.AIC <- 
+  auto.arima(log_trend1_xts,
+             d = 1,             # parameter d of ARIMA model
+             max.p = 9,         # Maximum value of p
+             max.q = 9,         # Maximum value of q
+             max.order = 18,    # maximum p+q
+             start.p = 1,       # Starting value of p in stepwise procedure
+             start.q = 1,       # Starting value of q in stepwise procedure
+             ic = "aic",        # Information criterion to be used in model selection.
+             stepwise = FALSE,  # if FALSE considers all models
+             allowdrift = TRUE, # include a constant
+             trace = TRUE)      # show summary of all models considered
+```
+
+According to the automatic function, best model is ARIMA(0,1,8) with drift.
+
+Let's test the significance of its coefficients:
+
+```{r}
+coeftest(arima.best.AIC)
+```
+
+-   ma1, ma2, and ma8 are significant while ma3 to ma7 are not and might indicate some over-parametrization. Moreover, the drift term is also significant, suggesting it should be included in the model.
+
+#### Model diagnostics
+
+Let's again look at the ACF and PACF plots:
+
+```{r}
+acf(resid(arima.best.AIC), 
+    lag.max = 48, 
+    lwd = 7, 
+    col = "darkred", 
+    na.action = na.pass,
+    ylim = c(-0.08, 0.05))
+pacf(resid(arima.best.AIC), 
+     lag.max = 48, 
+     lwd = 7, 
+     col = "darkred", 
+     na.action = na.pass)
+```
+
+Residuals look overall good although showing 2 significant spikes, so let's check the statistics.
+
+Performing the Ljung-Box test and the BG test for the residuals:
+
+```{r}
+Box.test(resid(arima.best.AIC), type = "Ljung-Box", lag =  5)
+bgtest(arima.best.AIC$residuals ~ fitted(arima.best.AIC), order = 5)
+```
+
+For both tests the p.value is 0.999 meaning that residuals are not autocorrelated and they are white noise.
+
+Let's now compare AIC and BIC values for both the automatic and the manual model:
+
+```{r}
+AIC(arima.best.AIC, model2)
+BIC(arima.best.AIC, model2)
+```
+
+As the table shows, the automatic model is just slighlty better in terms of AIC but the manual model is way better in BIC.
+
+### Auto BIC
+
+Let's now do the same procedure by selecting the best model in terms of BIC:
+
+```{r}
+arima.best.BIC <- 
+  auto.arima(log_trend1_xts,
+             d = 1,             # parameter d of ARIMA model
+             max.p = 9,         # Maximum value of p
+             max.q = 9,         # Maximum value of q
+             max.order = 18,    # maximum p+q
+             start.p = 1,       # Starting value of p in stepwise procedure
+             start.q = 1,       # Starting value of q in stepwise procedure
+             ic = "bic",        # Information criterion to be used in model selection.
+             stepwise = FALSE,  # if FALSE considers all models
+             allowdrift = TRUE, # include a constant
+             trace = TRUE)      # show summary of all models considered
+```
+
+In this case ARIMA(0,1,1) with drift is selected.
+
+#### Diagnostics
+
+Significancy of the coefficients is tested:
+
+```{r}
+coeftest(arima.best.BIC)
+```
+
+As shown by the results, both the ma1 and the drift are significant at 5% level.
+
+Let's now inspect the ACF and PACF plots:
+
+```{r}
+par(mfrow=c(1,1))
+acf(resid(arima.best.BIC), 
+    lag.max = 48, 
+    lwd = 7, 
+    col = "darkred", 
+    na.action = na.pass,
+    ylim = c(-0.06, 0.06))
+pacf(resid(arima.best.BIC), 
+     lag.max = 48, 
+     lwd = 7, 
+     col = "darkred", 
+     na.action = na.pass)
+```
+
+For this model way more spikes are observable, suggesting a check on the autocorrelation of the residuals:
+
+```{r}
+Box.test(resid(arima.best.BIC), type = "Ljung-Box", lag =  5)
+bgtest(arima.best.BIC$residuals ~ fitted(arima.best.BIC), order = 5)
+
+```
+
+According to the tests there is no significant autocorrelation in the residuals, even though the values are pretty low compared to the other models, suggesting there might be some issues.
+
+Let's also check its values of BIC/AIC compared with the other models:
+
+```{r}
+BIC(arima.best.BIC, arima.best.AIC, model2)
+AIC(arima.best.BIC, arima.best.AIC, model2)
+```
+
+Also in this case, the values of BIC is higher for the automatic model but the value of AIC is higher for the manual one.
+
+# FORECASTING
+
+This section is going to be about forecasting, where the performance of predicting the next values of two different models are compared.
+
+## Manual model
+
+First of all, data is split in an "in sample" period and an "out-of-sample" period that is going to be used to test the model performances.
+
+```{r}
+# Define the split point
+split_point <- floor(0.9 * length(log_trend1_xts))
+
+# Split the data into training and testing sets
+train_data <- window(log_trend1_xts, end = index(log_trend1_xts)[split_point])
+test_data <- window(log_trend1_xts, start = index(log_trend1_xts)[split_point + 1])
+```
+
+Then, the model is ran on the in-sample period:
+
+```{r}
+manual_model <- Arima(train_data, order = c(1, 1, 2), include.constant = TRUE)
+```
+
+Let's now forecast the values for the out-of-sample period:
+
+```{r}
+# Generate out-of-sample forecasts for the length of the test set
+forecast_horizon <- length(test_data)
+out_of_sample_forecast <- forecast(manual_model, h = forecast_horizon)
+forecasts_data <- data.frame(f_mean  = as.numeric(out_of_sample_forecast$mean),
+                             f_lower = as.numeric(out_of_sample_forecast$lower[, 2]),
+                             f_upper = as.numeric(out_of_sample_forecast$upper[, 2]))
+```
+
+Now that the forecasts are generated, the data is manipulated a bit to make sure a graph can be shown:
+
+```{r}
+AI.oos <- test_data
+# Ensure names match for consistency
+names(AI.oos) <- "V1"
+colnames(train_data) <- "V1"
+AI2 <- rbind(train_data[, "V1"], AI.oos)
+forecasts_xts <- xts(forecasts_data, order.by = index(AI.oos))
+forecasted_data <- merge(AI2, forecasts_xts)
+```
+
+Let's now see the graph of the time series with the forecasted values:
+
+```{r}
+plot(forecasted_data[, c("V1", "f_mean", "f_lower", "f_upper")], 
+     major.ticks = "years", 
+     grid.ticks.on = "years",
+     grid.ticks.lty = 3,
+     main = "forecast of 'AI' search term",
+     col = c("black", "blue", "red", "red"))
+```
+
+Just from the graph the predictions look pretty good, but some measures have to be analyzed.
+
+The data has been transformed back to normal and error measures analyzed:
+
+-   **MAE** (Mean Absolute Error)
+
+-   **MSE** (Mean Square Error)
+
+-   **MAPE** (Mean Absolute Percentage Error)
+
+-   **AMAPE** (Adjusted Mean Absolute Percentage Error)
+
+```{r}
+eval_data_oos <- tail(forecasted_data, length(test_data))
+eval_data_oos$V1 <- exp(eval_data_oos$V1)
+eval_data_oos$f_mean <- exp(eval_data_oos$f_mean)
+eval_data_oos$f_lower <- exp(eval_data_oos$f_lower)
+eval_data_oos$f_upper <- exp(eval_data_oos$f_upper)
+eval_data_oos$mae   <-  abs(eval_data_oos$V1 - eval_data_oos$f_mean)
+eval_data_oos$mse   <-  (eval_data_oos$V1 - eval_data_oos$f_mean) ^ 2
+eval_data_oos$mape  <-  abs((eval_data_oos$V1 - eval_data_oos$f_mean)/eval_data_oos$V1)
+eval_data_oos$amape <-  abs((eval_data_oos$V1 - eval_data_oos$f_mean)/(eval_data_oos$V1 + eval_data_oos$f_mean))
+eval_data_oos
+```
+
+Let's save the average errors for the out-of-sample evaluation data:
+
+```{r}
+perf_manual_model = colMeans(eval_data_oos[, c("mae", "mse", "mape", "amape")])
+```
+
+Values will be analyzed and compared to the ones of the automatic model.
+
+## Automatic model
+
+As an automatic model to compare, ARIMA(0,1,8) is chosen due to its better behavior of the residuals and similar AIC/BIC values.
+
+```{r}
+automatic_model <- Arima(train_data, order = c(0, 1, 8), include.constant = TRUE)
+```
+
+Let's now forecast the values for the out-of-sample period:
+
+```{r}
+# Generate out-of-sample forecasts for the length of the test set
+out_of_sample_forecast_auto <- forecast(automatic_model, h = forecast_horizon)
+
+forecasts_data_auto <- data.frame(f_mean  = as.numeric(out_of_sample_forecast_auto$mean),
+                             f_lower = as.numeric(out_of_sample_forecast_auto$lower[, 2]),
+                             f_upper = as.numeric(out_of_sample_forecast_auto$upper[, 2]))
+```
+
+Now that the forecasts are generated, the data is manipulated a bit to make sure a graph can be shown:
+
+```{r}
+forecasts_auto_xts <- xts(forecasts_data_auto,
+                     order.by = index(AI.oos))
+forecasted_data_auto <- merge(AI2, forecasts_auto_xts)
+```
+
+Let's now see the graph of the time series with the forecasted values by the automatic model:
+
+```{r}
+plot(forecasted_data_auto[, c("V1", "f_mean", "f_lower", "f_upper")], 
+     major.ticks = "years", 
+     grid.ticks.on = "years",
+     grid.ticks.lty = 3,
+     main = "forecast of 'AI' search term",
+     col = c("black", "blue", "red", "red"))
+```
+
+Also in this case, the prediction don't look far from the actual values, but we can't tell just by looking at the graph which of the two models is performing better.
+
+So, again the error measures are computed and saved to be compared with the other model:
+
+```{r}
+eval_data_oos_auto <- tail(forecasted_data_auto, length(test_data))
+eval_data_oos_auto$V1 <- exp(eval_data_oos_auto$V1)
+eval_data_oos_auto$f_mean <- exp(eval_data_oos_auto$f_mean)
+eval_data_oos_auto$f_lower <- exp(eval_data_oos_auto$f_lower)
+eval_data_oos_auto$f_upper <- exp(eval_data_oos_auto$f_upper)
+eval_data_oos_auto$mae   <-  abs(eval_data_oos_auto$V1 - eval_data_oos_auto$f_mean)
+eval_data_oos_auto$mse   <-  (eval_data_oos_auto$V1 - eval_data_oos_auto$f_mean) ^ 2
+eval_data_oos_auto$mape  <-  abs((eval_data_oos_auto$V1 - eval_data_oos_auto$f_mean)/eval_data_oos_auto$V1)
+eval_data_oos_auto$amape <-  abs((eval_data_oos_auto$V1 - eval_data_oos_auto$f_mean)/(eval_data_oos_auto$V1 + eval_data_oos_auto$f_mean))
+```
+
+```{r}
+perf_auto_model = colMeans(eval_data_oos_auto[, c("mae", "mse", "mape", "amape")])
+```
+
+## Performance comparison
+
+Let's now compare the error measures of the two models to select the best one:
+
+```{r}
+# Combine the performance metrics into a single data frame
+combined_perf <- data.frame(
+  ARIMA_1_1_2 = perf_manual_model,
+  ARIMA_0_1_8 = perf_auto_model
+)
+
+# Print the combined table
+print(combined_perf)
+```
+
+-   **Overall Performance**: The ARIMA(1,1,2) model outperforms the ARIMA(0,1,8) model in all error metrics (MAE, MSE, MAPE, and AMAPE).
+
+-   **Model Choice**: Based on these error measures, the ARIMA(1,1,2) model appears to be a better choice for forecasting, as it consistently provides more accurate predictions with smaller errors.
+
+-   **Error Distribution**: The significant difference in MSE suggests that the ARIMA(1,1,2) model not only has smaller average errors but also fewer large errors compared to the ARIMA(0,1,8) model.
+
+These results support the preference for the ARIMA(1,1,2) model due to its superior accuracy and robustness in predicting the data.
+
+# SECOND TIME SERIES
+
+Now are going to load the second time series by using the "gtrends" package, and it is about the searches of the phrase "Chat GPT".
+
+## Loading data and transformations
+
+```{r}
+# Define the search term
+search_term <- "Chat GPT"
+
+# Calculate the current date and the date 5 years ago
+end_date <- as.Date("2024-05-26")
+start_date <- end_date %m-% years(5)
+
+# Format the date range
+time_frame <- paste0(start_date, " ", end_date)
+
+# Fetch the trend data
+trend_data <- gtrends(search_term, time = time_frame)
+
+# Extract the interest over time data
+interest_over_time <- trend_data$interest_over_time
+
+gpt_data = interest_over_time[,1:2]
+
+gpt_data$date <- as.Date(gpt_data$date, format = "%Y-%m-%d")
+```
+
+```{r}
+gpt_data$hits <- as.numeric(gsub("<1", "0", gpt_data$hits))
+gpt_data$hits <- as.numeric(gpt_data$hits)
+```
+
+```{r}
+# Convert the data frame to xts object
+gpt_xts <- xts(gpt_data$hits, order.by = gpt_data$date)
+plot(gpt_xts,
+     type = "l",
+     col  = "darkred",
+     lwd  = 3,
+     main = "'Chat GPT' Search Trends - Last 5 years - Log")
+```
+
+```{r}
+# Log transformation
+gpt_xts <- gpt_xts + 1e-8
+log_gpt_xts <- log(gpt_xts)
+```
+
+## Checking integration order
+
+```{r}
+diff_log_gpt_xts <- diff(log_gpt_xts, differences = 1)
+plot(diff_log_gpt_xts,
+type = "l",
+col = "darkred",
+lwd = 3,
+main = "'Chat GPT' Search Trends - Last 5 years - Log")
+```
+
+```{r}
+diff_log_gpt_xts <- diff_log_gpt_xts[-1,]
+gpt_adf_test <- ur.df(diff_log_gpt_xts, type = "drift", lags = 0)
+summary(gpt_adf_test)
+```
+
+The test statistic is far below the critical value, so we can reject the null-hypothesis of non-stationarity.
+
+Let's check more tests:
+
+```{r}
+gpt_pp.test <- ur.pp(diff_log_gpt_xts,   # tested series
+                 type = c("Z-tau"),     # standardization of the test statistic needed
+                 model = c("constant")) # constant deterministic component
+# which means we assume that any trends in the data are stochastic
+summary(gpt_pp.test)
+```
+
+This test also confirms the non stationarity, so we can say that the series is \~ I(1).
+
+## ACF - PACF Evaluations
+
+```{r}
+# ACF and PACF plots of the differenced series
+acf_plot <- ggAcf(diff_log_gpt_xts, main = "ACF of Differenced Log-Transformed Data")
+pacf_plot <- ggPacf(diff_log_gpt_xts, main = "PACF of Differenced Log-Transformed Data")
+
+gridExtra::grid.arrange(acf_plot, pacf_plot, ncol = 2)
+```
+
+From the plots we can see AR(1) and MA(1).
+
+Let's now check ACF and PACF for the residuals:
+
+# ARIMA
+
+## Fitting two models
+
+We are going to compare ARIMA (1,1,1) with drift and without it:
+
+```{r}
+# Fit two different ARIMA models - constant and no constant
+ts2_model1 <- Arima(log_gpt_xts, order = c(1, 1, 1), include.constant = TRUE)
+ts2_model2 <- Arima(log_gpt_xts, order = c(1, 1, 1), include.constant = FALSE)
+residuals_ts2_model1 <- residuals(ts2_model1)
+residuals_ts2_model2 <- residuals(ts2_model2)
+```
+
+## Diagnostics
+
+Let's check their respective ACF and PACF plots:
+
+```{r}
+par(mfrow = c(2, 2))
+Acf(residuals_ts2_model1, main = "ACF of Residuals of ARIMA(1,1,1) with drift")
+Pacf(residuals_ts2_model1, main = "PACF of Residuals of ARIMA(1,1,1) with drift")
+Acf(residuals_ts2_model2, main = "ACF of Residuals of ARIMA(1,1,1)")
+Pacf(residuals_ts2_model2, main = "PACF of Residuals of ARIMA(1,1,1)")
+```
+
+From the plots it looks like there is no autocorrelation in the residuals for both models, let's now check with the tests:
+
+```{r}
+# Perform tests on residuals to check for white noise
+lb_test_ts2_model1 <- Box.test(residuals_ts2_model1, lag = 1, type = "Ljung-Box")
+lb_test_ts2_model2 <- Box.test(residuals_ts2_model2, lag = 1, type = "Ljung-Box")
+bg_test_ts2_model1 <- bgtest(residuals_ts2_model1 ~ fitted(ts2_model1), order = 1)
+bg_test_ts2_model2 <- bgtest(residuals_ts2_model2 ~ fitted(ts2_model2), order = 1)
+```
+
+After comparing lags = 5 (rule of thumb) and lags = 1 (intuition), 1 was selected since it makes more sense in the context of application.
+
+```{r}
+# Create a table to compare results
+comparison_table_2 <- data.frame(
+  Model = c("ARIMA(1,1,1) with drift", "ARIMA(1,1,1)"),
+  AIC = c(AIC(ts2_model1), AIC(ts2_model2)),
+  BIC = c(BIC(ts2_model1), BIC(ts2_model2)),
+  LjungBox_p_value = c(lb_test_ts2_model1$p.value, lb_test_ts2_model2$p.value), BG_statistic = c(bg_test_ts2_model1$p.value, bg_test_ts2_model2$p.value))
+
+# Print the comparison table
+print(comparison_table_2)
+```
+
+None of the models shows autocorrelation in the residuals, ARIMA (1,1,1) is selected for lower AIC and BIC values.
+
+# AUTO-ARIMA
+
+## Automatic model selection
+
+Let's look for the best models in terms of AIC and BIC:
+
+```{r}
+ts2_arima.best.AIC <- 
+  auto.arima(log_gpt_xts,
+             d = 1,             # parameter d of ARIMA model
+             max.p = 2,         # Maximum value of p
+             max.q = 2,         # Maximum value of q
+             max.order = 4,    # maximum p+q
+             start.p = 0,       # Starting value of p in stepwise procedure
+             start.q = 0,       # Starting value of q in stepwise procedure
+             ic = "aic",        # Information criterion to be used in model selection.
+             stepwise = FALSE,  # if FALSE considers all models
+             allowdrift = TRUE, # include a constant
+             trace = TRUE)      # show summary of all models considered
+```
+
+```{r}
+ts2_arima.best.BIC <- 
+  auto.arima(log_gpt_xts,
+             d = 1,             # parameter d of ARIMA model
+             max.p = 2,         # Maximum value of p
+             max.q = 2,         # Maximum value of q
+             max.order = 4,    # maximum p+q
+             start.p = 0,       # Starting value of p in stepwise procedure
+             start.q = 0,       # Starting value of q in stepwise procedure
+             ic = "bic",        # Information criterion to be used in model selection.
+             stepwise = FALSE,  # if FALSE considers all models
+             allowdrift = TRUE, # include a constant
+             trace = TRUE)      # show summary of all models considered
+```
+
+From these automatic selection methods, ARIMA (0,1,1) and ARIMA (0,1,0) were selected.
+
+## Automatic models diagnostics
+
+```{r}
+ts2_arima.best.AIC_res = residuals(ts2_arima.best.AIC)
+ts2_arima.best.BIC_res = residuals(ts2_arima.best.BIC)
+par(mfrow = c(1, 2))
+Acf(ts2_arima.best.AIC_res, main = "ACF of Residuals of ARIMA(0,1,1)")
+Pacf(ts2_arima.best.BIC_res, main = "PACF of Residuals of ARIMA(0,1,0)")
+```
+
+ARIMA (0,1,1) shows no autocorrelation in the residuals while ARIMA (0,1,0) shows just one spike at lag 1.
+
+Let's continue with the tests:
+
+```{r}
+lb_test_ts2_model3 <- Box.test(ts2_arima.best.AIC_res, lag = 1, type = "Ljung-Box")
+lb_test_ts2_model4 <- Box.test(ts2_arima.best.BIC_res, lag = 1, type = "Ljung-Box")
+bg_test_ts2_model3 <- bgtest(ts2_arima.best.AIC_res ~ fitted(ts2_arima.best.AIC), order = 1)
+bg_test_ts2_model4 <- bgtest(ts2_arima.best.BIC_res ~ fitted(ts2_arima.best.BIC), order = 1)
+```
+
+```{r}
+# Create a table to compare results
+comparison_table_3 <- data.frame(
+  Model = c("ARIMA(0,1,1)", "ARIMA(0,1,0)"),
+  AIC = c(AIC(ts2_arima.best.AIC), AIC(ts2_arima.best.BIC)),
+  BIC = c(BIC(ts2_arima.best.AIC), BIC(ts2_arima.best.BIC)),
+  LjungBox_p_value = c(lb_test_ts2_model3$p.value, lb_test_ts2_model4$p.value), BG_statistic = c(bg_test_ts2_model3$p.value, bg_test_ts2_model4$p.value))
+
+# Print the comparison table
+print(comparison_table_3)
+```
+
+The tests confirm the presence of autocorrelation for the ARIMA (0,1,0) when considering one lag.
+
+For this reason, after checking for the significance of its coefficient we are going to select ARIMA(0,1,1)
+
+```{r}
+coeftest(ts2_arima.best.AIC)
+```
+
+As we can see the moving average term is significant at 5% level.
+
+# FORECASTING
+
+## Manual selection
+
+Let's now compare ARIMA(1,1,1) and ARIMA(0,1,1) models in terms of forecasting:
+
+```{r}
+# Split the data into training and testing sets
+split_point <- floor(0.95 * length(log_gpt_xts))
+ts2_train_data <- window(log_gpt_xts, end = index(log_gpt_xts)[split_point])
+ts2_test_data <- window(log_gpt_xts, start = index(log_gpt_xts)[split_point + 1])
+```
+
+```{r}
+ts2_manual_model <- Arima(ts2_train_data, order = c(1, 1, 1))
+ts2_auto_model <- Arima(ts2_train_data, order = c(0,1,1))
+```
+
+```{r}
+# Generate out-of-sample forecasts for the length of the test set
+forecast_horizon <- length(ts2_test_data)
+ts2_out_of_sample_forecast <- forecast(ts2_manual_model, h = forecast_horizon)
+ts2_forecasts_data <- data.frame(f_mean  = as.numeric(ts2_out_of_sample_forecast$mean),
+                             f_lower = as.numeric(ts2_out_of_sample_forecast$lower[, 2]),
+                             f_upper = as.numeric(ts2_out_of_sample_forecast$upper[, 2]))
+```
+
+```{r}
+gpt.oos <- ts2_test_data
+# Ensure names match for consistency
+names(gpt.oos) <- "V1"
+colnames(ts2_train_data) <- "V1"
+gpt2 <- rbind(ts2_train_data[, "V1"], gpt.oos)
+ts2_forecasts_xts <- xts(ts2_forecasts_data, order.by = index(gpt.oos))
+ts2_forecasted_data <- merge(gpt2, ts2_forecasts_xts)
+```
+
+```{r}
+plot(ts2_forecasted_data[, c("V1", "f_mean", "f_lower", "f_upper")], 
+     major.ticks = "years", 
+     grid.ticks.on = "years",
+     grid.ticks.lty = 3,
+     main = "forecast of 'Chat GPT' search term",
+     col = c("black", "blue", "red", "red"))
+```
+
+```{r}
+eval_data_oos <- tail(ts2_forecasted_data, length(ts2_test_data))
+eval_data_oos$V1 <- exp(eval_data_oos$V1)
+eval_data_oos$f_mean <- exp(eval_data_oos$f_mean)
+eval_data_oos$f_lower <- exp(eval_data_oos$f_lower)
+eval_data_oos$f_upper <- exp(eval_data_oos$f_upper)
+eval_data_oos$mae   <-  abs(eval_data_oos$V1 - eval_data_oos$f_mean)
+eval_data_oos$mse   <-  (eval_data_oos$V1 - eval_data_oos$f_mean) ^ 2
+eval_data_oos$mape  <-  abs((eval_data_oos$V1 - eval_data_oos$f_mean)/eval_data_oos$V1)
+eval_data_oos$amape <-  abs((eval_data_oos$V1 - eval_data_oos$f_mean)/(eval_data_oos$V1 + eval_data_oos$f_mean))
+eval_data_oos
+```
+
+```{r}
+ts2_perf_manual_model = colMeans(eval_data_oos[, c("mae", "mse", "mape", "amape")])
+```
+
+## Automatic selection
+
+```{r}
+# Generate out-of-sample forecasts for the length of the test set
+forecast_horizon <- length(ts2_test_data)
+ts2_out_of_sample_forecast <- forecast(ts2_auto_model, h = forecast_horizon)
+ts2_forecasts_data_auto <- data.frame(f_mean  = as.numeric(ts2_out_of_sample_forecast$mean),
+                             f_lower = as.numeric(ts2_out_of_sample_forecast$lower[, 2]),
+                             f_upper = as.numeric(ts2_out_of_sample_forecast$upper[, 2]))
+```
+
+```{r}
+ts2_forecasts_auto_xts <- xts(ts2_forecasts_data_auto,
+                     order.by = index(gpt.oos))
+ts2_forecasted_data_auto <- merge(gpt2, ts2_forecasts_auto_xts)
+```
+
+```{r}
+plot(ts2_forecasted_data_auto[, c("V1", "f_mean", "f_lower", "f_upper")], 
+     major.ticks = "years", 
+     grid.ticks.on = "years",
+     grid.ticks.lty = 3,
+     main = "forecast of 'Chat GPT' search term",
+     col = c("black", "blue", "red", "red"))
+```
+
+```{r}
+eval_data_oos <- tail(ts2_forecasted_data_auto, length(ts2_test_data))
+eval_data_oos$V1 <- exp(eval_data_oos$V1)
+eval_data_oos$f_mean <- exp(eval_data_oos$f_mean)
+eval_data_oos$f_lower <- exp(eval_data_oos$f_lower)
+eval_data_oos$f_upper <- exp(eval_data_oos$f_upper)
+eval_data_oos$mae   <-  abs(eval_data_oos$V1 - eval_data_oos$f_mean)
+eval_data_oos$mse   <-  (eval_data_oos$V1 - eval_data_oos$f_mean) ^ 2
+eval_data_oos$mape  <-  abs((eval_data_oos$V1 - eval_data_oos$f_mean)/eval_data_oos$V1)
+eval_data_oos$amape <-  abs((eval_data_oos$V1 - eval_data_oos$f_mean)/(eval_data_oos$V1 + eval_data_oos$f_mean))
+eval_data_oos
+```
+
+```{r}
+ts2_perf_auto_model = colMeans(eval_data_oos[, c("mae", "mse", "mape", "amape")])
+```
+
+## Comparison
+
+```{r}
+# Combine the performance metrics into a single data frame
+ts2_combined_perf <- data.frame(
+  ARIMA_1_1_1 = ts2_perf_manual_model,
+  ARIMA_0_1_1 = ts2_perf_auto_model
+)
+
+# Print the combined table
+print(ts2_combined_perf)
+```
+
+As we can see from the table, it looks like ARIMA (1,1,1) performs slightly better, so also in this case the manual model proved to be better.
+
+# TESTING COINTEGRATION
+
+First of all, we are going to shorten the period considered up to the date when ChatGPT went out.
+
+```{r}
+series <- merge.xts(log_trend1_xts, log_gpt_xts)
+colnames(series) <- c("AI", "ChatGPT")
+```
+
+```{r}
+plot(series[184:262, 1:2],
+     col = c("black", "blue"),
+     major.ticks = "months", 
+     grid.ticks.on = "months",
+     grid.ticks.lty = 7,
+     main = "'AI' vs 'ChatGPT search trends",
+     legend.loc = "bottomright")
+```
+
+The cointegrating vector is then estimated:
+
+```{r}
+model.coint <- lm(AI ~ ChatGPT, data = series)
+summary(model.coint)
+```
+
+Testing the stationarity of the residuals:
+
+```{r}
+adf.test(residuals(model.coint))
+```
+
+Since the p-value is 0.04, we reject the null about non-stationarity, so we can conclude that the two series are **cointegrated**.
+
+## Johansen cointegration test
+
+We can also check it by performing the Johansen Test:
+
+```{r}
+# Convert the relevant columns to a matrix
+series_matrix <- as.matrix(series[, c("ChatGPT", "AI")])
+
+# Perform the Johansen cointegration test
+johansen_test <- ca.jo(series_matrix, type = "trace", ecdet = "none", K = 5)
+
+# Summary of the test results
+summary(johansen_test)
+```
+
+**Null Hypothesis r=0:**
+
+-   The test statistic is 23.55, which is above the 5% critical value of 14.90. This suggests that we can reject the null hypothesis of no cointegrating relationships at the 5% level, indicating the presence of one cointegrating relationship between ChatGPT and AI.
+
+**Null Hypothesis r\<=1:**
+
+-   The test statistic is 0.20, which is well below the 5% critical value of 8.18. This means we fail to reject the null hypothesis that there is at most 1 cointegrating relationship.
+
+We can conclude that the two time series are cointegrated and there is only one cointegrating vector.
+
+# GRANGER CAUSALITY
+
+In this section we want to check if either of the series is Granger caused by the other one:
+
+```{r}
+diff_series <- diff(series)
+```
+
+```{r}
+granger_test_result <- grangertest(AI ~ ChatGPT, order = 5, data= diff_series)
+print(granger_test_result)
+```
+
+The output of the Granger causality test shows that the p-value is close to 0, which is lower than the typical significance level of 0.05. This indicates that we reject the null hypothesis of no granger causality, suggesting that **AI** search **does** Granger-cause **Chat GPT** searches.
+
+In other words, including lagged values of AI searches time series improves the predictive ability of the model over including only the ones of ChatGPT searches time series.
+
+```{r}
+granger_test_result_reverse <- grangertest(ChatGPT ~ AI, order = 5, data = diff_series)
+print(granger_test_result_reverse)
+```
+
+Given the p-value higher than 0.05, we fail to reject the null hypothesis, meaning that the past values of **Chat GPT** searches **do not** **Granger-cause** **AI** searches.
+
+# VAR MODEL
+
+## Selecting lags
+
+First of all, the optimal number of lags has to be found:
+
+```{r}
+VARselect(series, # input data for VAR
+          lag.max = 6)     # maximum lag
+```
+
+```{r}
+VARselect(series, lag.max = 6) %>%
+  .$criteria %>% 
+  t() %>% 
+  as_tibble() %>% 
+  mutate(nLags = 1:nrow(.)) %>%
+  select(nLags, everything()) %>%
+  kbl(digits = 3) %>%
+  kable_classic("striped", full_width = F)
+```
+
+Since 2,3 and 5 lags are optimal, 5 are going to be selected.
+
+## Model
+
+```{r}
+series.var5 <- VAR(series, p = 5) # order of VAR model
+summary(series.var5)
+```
+
+The roots of the characteristic polynomial are within or very close to the unit circle (1.002, 0.9122, etc.), indicating that the VAR model is stable.
+
+### Equation for AI:
+
+-   Significant lags: **AI.l1, ChatGPT.l1, ChatGPT.l2, AI.l3, ChatGPT.l5**, and **const,** indicating a good predictive power of ChatGPT on AI.
+
+-   High R\^2 (0.9944) indicates that the model explains 99.44% of the variance in AI.
+
+### Equation for ChatGPT:
+
+-   Significant lags: only **ChatGPT.l1,** while the other being non significant; this indicates limited predictive power of AI on ChatGPT.
+
+**Residuals**:
+
+-   The residuals show some correlation (0.1912), but this is not particularly strong.
+
+### Diagnostics
+
+```{r}
+plot(series.var5)
+```
+
+For both equations we see significant spikes at lag 0 of the ACF plot. This autocorrelation at lag 0 indicates that the current values of each variable strongly depend on their previous values, which can happen in time series data where variables exhibit persistence.
+
+Let's check the residuals formally by using **Portmanteau test**:
+
+```{r}
+serial.test(series.var5)
+```
+
+Since the P-value is 0.77, we fail to reject the null of no autocorrelation.
+
+Also with the BG test:
+
+```{r}
+serial.test(series.var5, type = "BG")
+```
+
+Also in this case we fail to reject the null hypothesis since the p-value is \> 0.05.
+
+### Information Criteria
+
+Let's compare with the information criteria with models having the other suggested number of lags (2 and 3):
+
+```{r}
+series.var2 = VAR(series, p=2)
+series.var3 = VAR(series, p=3)
+```
+
+```{r}
+AIC(series.var2, series.var3, series.var5)
+```
+
+```{r}
+BIC(series.var2, series.var3, series.var5)
+```
+
+AIC suggests 5 or 3 lags, BIC suggests 2 or 3 lags.
+
+Since BIC is slightly prefered in the context of VAR, let's check the residuals of the model with 2 lags:
+
+```{r}
+plot(series.var2)
+```
+
+A spike at lag 2 of the PACF plot can be seen; let's test it formally:
+
+```{r}
+serial.test(series.var2)
+serial.test(series.var2, type = "BG")
+```
+
+As we can see from the Breusch-Godfrey test, in this case the residuals show autocorrelation, so the model with 5 lags is still prefered.
+
+The VAR model with 3 lags is also checked:
+
+```{r}
+summary(series.var3)
+```
+
+```{r}
+plot(series.var3)
+```
+
+Also in this case a significant spike at lag 4 of the PACF plot is detected.
+
+Let's use the tests:
+
+```{r}
+serial.test(series.var3)
+serial.test(series.var3, type = "BG")
+```
+
+At 5% significance level, there is no evidence of autocorrelation in the residuals, so the VAR model with 3 lags is going to be selected because of its lower BIC and also less parameters.
+
+### Impulse response functions
+
+```{r}
+plot(irf(series.var3, n.ahead = 18))
+```
+
+```{r}
+plot(fevd(series.var3, n.ahead = 18))
+```
+
+Impulse response function for AI:
+
+-   **Impact on AI:** When there is a sudden spike in searches for "AI" (e.g., a significant news event related to AI), searches for "AI" itself see an immediate positive effect. This means that interest in "AI" increases sharply in response to relevant events, but the effect stabilizes quickly, indicating that the spike in interest doesn't last long.
+
+-   **Impact on ChatGPT:** A sudden spike in searches for "AI" gradually influences searches for "ChatGPT". The impact starts small and grows over time, suggesting that as people search for "AI", they increasingly also search for "ChatGPT". This could indicate that interest in AI-related developments or news gradually leads to more curiosity and searches about specific AI applications like ChatGPT.
+
+Impulse response function from ChatGPT:
+
+-   **Impact on ChatGPT:** When there is a sudden spike in searches for "ChatGPT" (e.g., a significant news event or release related to ChatGPT), searches for "ChatGPT" itself increase sharply but this effect gradually declines. This suggests that interest in "ChatGPT" spikes in response to specific events but fades over time as the initial excitement wears off.
+
+-   **Impact on AI:** A sudden spike in searches for "ChatGPT" has a negligible effect on searches for "AI". This indicates that increased interest in ChatGPT does not lead to a significant increase in interest in the broader topic of AI. People searching for ChatGPT may already be aware of AI or may not feel the need to search for AI specifically.
+
+Interpretation of FEVD:
+
+FEVD for AI:
+
+-   The forecast error variance decomposition for "AI" shows that most of the variability in searches for "AI" can be explained by its own past search behavior. Over time, a small portion of the variability can be explained by searches for "ChatGPT", indicating that interest in "AI" is primarily self-driven with some influence from the increasing interest in "ChatGPT".
+
+FEVD for ChatGPT:
+
+-   The forecast error variance decomposition for "ChatGPT" indicates that almost all of the variability in searches for "ChatGPT" is explained by its own past search behavior, with very little influence from searches for "AI". This suggests that interest in "ChatGPT" is largely self-sustained and independent of the broader interest in AI.
+
+# VAR FORECASTING
+
+Let's now evaluate the forecasting power of the model:
+
+```{r}
+series.var3.forecast <- predict(series.var3,
+                                 n.ahead = 14,
+                                 ci = 0.95) # 95% confidence interval
+```
+
+Results are stored in a data frame:
+
+```{r}
+gpt_var_forecast <- xts(series.var3.forecast$fcst$ChatGPT[,-4], 
+                    # we exclude the last column with CI
+                    tail(index(series), 14))
+ai_var_forecast <- xts(series.var3.forecast$fcst$AI[,-4], 
+                    # we exclude the last column with CI
+                    tail(index(series), 14))
+```
+
+```{r}
+names(gpt_var_forecast) <- c("gpt_fore", "gpt_lower", "gpt_upper")
+names(ai_var_forecast) <- c("ai_fore", "ai_lower", "ai_upper")
+```
+
+```{r}
+ai_gpt_forecasts <- merge(series, 
+                 gpt_var_forecast,
+                 ai_var_forecast)
+```
+
+Let's now inspect them visually:
+
+```{r}
+plot(ai_gpt_forecasts["2022-12-04/", c("AI", "ai_fore",
+                        "ai_lower", "ai_upper")], 
+     major.ticks = "months", 
+     grid.ticks.on = "months",
+     grid.ticks.lty = 7,
+     main = "14 weeks forecast of AI",
+     col = c("black", "blue", "red", "red"))
+```
+
+```{r}
+plot(ai_gpt_forecasts["2022-12-04/", c("ChatGPT", "gpt_fore")], 
+     major.ticks = "months", 
+     grid.ticks.on = "months",
+     grid.ticks.lty = 7,
+     main = "14 weeks forecast of ChatGPT",
+     col = c("black", "blue"))
+```
+
+From the plots it is already pretty clear that the VAR model is performing worse than the ARIMA alternatives, but let's compare the error metrics anyway.
+
+```{r}
+ai_gpt_forecasts$AI <- exp(ai_gpt_forecasts$AI)
+ai_gpt_forecasts$ai_fore <- exp(ai_gpt_forecasts$ai_fore)
+ai_gpt_forecasts$ai_lower <- exp(ai_gpt_forecasts$ai_lower)
+ai_gpt_forecasts$ai_upper <- exp(ai_gpt_forecasts$ai_upper)
+ai_gpt_forecasts$mae.ai   <-  abs(ai_gpt_forecasts$AI - ai_gpt_forecasts$ai_fore)
+ai_gpt_forecasts$mse.ai   <-  (ai_gpt_forecasts$AI - ai_gpt_forecasts$ai_fore) ^ 2
+ai_gpt_forecasts$mape.ai  <-  abs((ai_gpt_forecasts$AI - ai_gpt_forecasts$ai_fore)/ai_gpt_forecasts$AI)
+ai_gpt_forecasts$amape.ai <-  abs((ai_gpt_forecasts$AI - ai_gpt_forecasts$ai_fore) / (ai_gpt_forecasts$AI + ai_gpt_forecasts$ai_fore))
+
+
+ai_gpt_forecasts$ChatGPT <- exp(ai_gpt_forecasts$ChatGPT)
+ai_gpt_forecasts$gpt_fore <- exp(ai_gpt_forecasts$gpt_fore)
+ai_gpt_forecasts$gpt_lower <- exp(ai_gpt_forecasts$gpt_lower)
+ai_gpt_forecasts$gpt_upper <- exp(ai_gpt_forecasts$gpt_upper)
+ai_gpt_forecasts$mae.gpt   <-  abs(ai_gpt_forecasts$ChatGPT - ai_gpt_forecasts$gpt_fore)
+ai_gpt_forecasts$mse.gpt   <-  (ai_gpt_forecasts$ChatGPT - ai_gpt_forecasts$gpt_fore) ^ 2
+ai_gpt_forecasts$mape.gpt  <-  abs((ai_gpt_forecasts$ChatGPT - ai_gpt_forecasts$gpt_fore)/ai_gpt_forecasts$ChatGPT)
+ai_gpt_forecasts$amape.gpt <-  abs((ai_gpt_forecasts$ChatGPT - ai_gpt_forecasts$gpt_fore) / (ai_gpt_forecasts$ChatGPT + ai_gpt_forecasts$gpt_fore))
+```
+
+```{r}
+var_metrics = colMeans(ai_gpt_forecasts[,9:16], na.rm = TRUE)
+```
+
+# FINAL COMPARISON
+
+Let's now compare the models' forecasting power, by starting with **ChatGPT** time series:
+
+```{r}
+ts2_combined_perf$VAR <- (var_metrics[5:8])
+ts2_combined_perf
+```
+
+-   The table clearly shows that ARIMA(1,1,1) is the best at forecasting future values compared to the others.
+
+-   VAR model has substantially higher errors across all metrics, suggesting that it is not well-suited for the given data.
+
+Let's also examine **AI** time series performances table:
+
+```{r}
+combined_perf$VAR <- (var_metrics[1:4])
+combined_perf
+```
+
+-   The table shows that ARIMA(1,1,2) is the best model at forecasting future values compared to the others.
+
+-   Also in this case, VAR model has higher errors across all metrics, suggesting that it is not well-suited for the given data.
+
+## Justification and Motivation for Results
+
+1.  **ARIMA Model Strengths:**
+
+    -   **Univariate Nature:** ARIMA models are designed for univariate time series data, making them ideal when the primary goal is to predict the future values of a single series without considering cross-series interactions.
+
+    -   **Strong Performance on Trend Data:** Google Trends data often exhibit clear patterns and trends, which ARIMA models can effectively capture and extrapolate.
+
+2.  **VAR Model Weaknesses:**
+
+    -   **Complexity and Data Requirements:** VAR models are more complex and require more data to accurately estimate the relationships between multiple time series. If these relationships are weak or not properly captured, the model's performance can degrade significantly.
+
+    -   **Overfitting Risks:** With more parameters to estimate, VAR models are prone to overfitting, especially if the underlying data does not strongly support the assumed interdependencies.
+
+## Final conclusions
+
+This project demonstrates the importance of model selection and validation in time series forecasting. While ARIMA models have shown strong performance with Google Trends data, the use of VAR models requires careful consideration of data characteristics and model specifications. The results obtained justify prioritizing ARIMA models for similar forecasting tasks, ensuring reliable and accurate predictions.
